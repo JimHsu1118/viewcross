@@ -39,6 +39,10 @@ class MainActivity : AppCompatActivity() {
 
         // 2. 底層：相機畫面
         previewView = PreviewView(this)
+
+        // 🌟 補上這一行：強制畫面不要放大裁切，保留相機的完整視野
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+
         rootLayout.addView(previewView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         // 3. 上層：透明的畫圖玻璃

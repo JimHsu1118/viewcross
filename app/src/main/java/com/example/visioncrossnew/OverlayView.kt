@@ -33,17 +33,13 @@ class OverlayView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        // 把 AI 算出的座標，依比例放大到手機螢幕上
-        val scaleX = width.toFloat() / 1280f
-        val scaleY = height.toFloat() / 1280f
-
         results.forEach { result ->
-            val left = result.x * scaleX
-            val top = result.y * scaleY
-            val right = (result.x + result.w) * scaleX
-            val bottom = (result.y + result.h) * scaleY
+            // 🌟 改這裡：直接用手機當下的真實寬度(width)與高度(height)來還原
+            val left = result.x * width
+            val top = result.y * height
+            val right = (result.x + result.w) * width
+            val bottom = (result.y + result.h) * height
 
-            // 畫框框與文字
             canvas.drawRect(left, top, right, bottom, boxPaint)
             canvas.drawText("${result.className} ${(result.confidence * 100).toInt()}%", left, top - 10, textPaint)
         }

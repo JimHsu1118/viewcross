@@ -76,10 +76,10 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                     for (y in 0 until expectedHeight) {
                         for (x in 0 until expectedWidth) {
                             val valPixel = intValues[pixel++]
-                            // 🌟 破案關鍵 1：恢復 / 255.0f，並改成 BGR 順序 (解救色盲)
-                            byteBuffer.putFloat((valPixel and 0xFF) / 255.0f)          // Blue 先塞
-                            byteBuffer.putFloat(((valPixel shr 8) and 0xFF) / 255.0f)  // Green
-                            byteBuffer.putFloat(((valPixel shr 16) and 0xFF) / 255.0f) // Red 最後
+                            // 🌟 改這裡：換回標準的 RGB 順序 (解救色盲)
+                            byteBuffer.putFloat(((valPixel shr 16) and 0xFF) / 255.0f) // 先塞 Red
+                            byteBuffer.putFloat(((valPixel shr 8) and 0xFF) / 255.0f)  // 再塞 Green
+                            byteBuffer.putFloat((valPixel and 0xFF) / 255.0f)          // 最後塞 Blue
                         }
                     }
                     val outputShape = interpreter.getOutputTensor(0).shape()
@@ -120,14 +120,9 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                             val left = cx - (w / 2)
                             val top = cy - (h / 2)
 
-                            // 放大回你的 1280 玻璃畫布
-                            val outLeft = left * 1280f
-                            val outTop = top * 1280f
-                            val outW = w * 1280f
-                            val outH = h * 1280f
-
+                            // 🌟 改這裡：把 outW, outH, * 1280f 全刪了，直接傳送原本的比例
                             val className = "專家${index + 1}-類別$classId"
-                            allResults.add(DetectionResult(outLeft, outTop, outW, outH, className, maxScore))
+                            allResults.add(DetectionResult(left, top, w, h, className, maxScore))
                         }
                     }
                 } catch (e: Exception) {
