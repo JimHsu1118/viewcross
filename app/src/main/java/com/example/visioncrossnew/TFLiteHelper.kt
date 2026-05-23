@@ -3,6 +3,11 @@ package com.example.visioncrossnew
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.Mat
+import org.opencv.core.Scalar
+import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -17,17 +22,15 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
     // 專注測試這兩位健康的專家
     private val modelFiles = listOf(
         "traffic_1280_dynamic_range_quant.tflite",
-        "yolov8n_dynamic_range_quant.tflite"
+        "yolov8n_dynamic_range_quant.tflite" // 假設這是包含綠色人行道的模型 (index = 1)
     )
 
     init {
         for (fileName in modelFiles) {
             try {
-                // 🌟 破案關鍵：建立模型設定檔，解鎖 4 核心運算！
                 val options = Interpreter.Options()
-                options.numThreads = 4 // 讓 4 個 CPU 核心同時幫忙算
+                options.numThreads = 4
 
-                // 🌟 把 options 傳進去給 Interpreter
                 val interpreter = Interpreter(loadModelFile(fileName), options)
 
                 interpreters.add(interpreter)
@@ -54,19 +57,27 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
         if (interpreters.isEmpty()) return
 
         try {
-            // 這裡收集所有專家看出來的「原始」答案
             val allResults = mutableListOf<DetectionResult>()
-
-            // 🌟 目前設定為 70% 嚴格門檻
             val threshold = 0.3f
 
+            // 🌟 裁切中心 60% 正方形，避免變形
+            val minSize = minOf(bitmap.width, bitmap.height)
+            val roiScale = 0.6f
+            val roiSize = (minSize * roiScale).toInt()
+            val roiX = (bitmap.width - roiSize) / 2
+            val roiY = (bitmap.height - roiSize) / 2
+
+            val croppedBitmap = Bitmap.createBitmap(bitmap, roiX, roiY, roiSize, roiSize)
+
             for ((index, interpreter) in interpreters.withIndex()) {
+                var resizedBitmap: Bitmap? = null
                 try {
                     val inputShape = interpreter.getInputTensor(0).shape()
                     val expectedHeight = inputShape[1]
                     val expectedWidth = inputShape[2]
 
-                    val resizedBitmap = Bitmap.createScaledBitmap(bitmap, expectedWidth, expectedHeight, true)
+                    resizedBitmap = Bitmap.createScaledBitmap(croppedBitmap, expectedWidth, expectedHeight, true)
+
                     val byteBuffer = ByteBuffer.allocateDirect(1 * expectedWidth * expectedHeight * 3 * 4)
                     byteBuffer.order(ByteOrder.nativeOrder())
                     val intValues = IntArray(expectedWidth * expectedHeight)
@@ -76,22 +87,19 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                     for (y in 0 until expectedHeight) {
                         for (x in 0 until expectedWidth) {
                             val valPixel = intValues[pixel++]
-                            // 🌟 改這裡：換回標準的 RGB 順序 (解救色盲)
-                            byteBuffer.putFloat(((valPixel shr 16) and 0xFF) / 255.0f) // 先塞 Red
-                            byteBuffer.putFloat(((valPixel shr 8) and 0xFF) / 255.0f)  // 再塞 Green
-                            byteBuffer.putFloat((valPixel and 0xFF) / 255.0f)          // 最後塞 Blue
+                            byteBuffer.putFloat(((valPixel shr 16) and 0xFF) / 255.0f) // R
+                            byteBuffer.putFloat(((valPixel shr 8) and 0xFF) / 255.0f)  // G
+                            byteBuffer.putFloat((valPixel and 0xFF) / 255.0f)          // B
                         }
                     }
+
                     val outputShape = interpreter.getOutputTensor(0).shape()
                     val numBoxElements = outputShape[1]
                     val numBoxes = outputShape[2]
                     val outputArray = Array(1) { Array(numBoxElements) { FloatArray(numBoxes) } }
 
                     interpreter.run(byteBuffer, outputArray)
-
                     val numClasses = numBoxElements - 4
-
-                    var hasLoggedThisFrame = false
 
                     for (i in 0 until numBoxes) {
                         var maxScore = 0f
@@ -110,29 +118,68 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                             val rawW = outputArray[0][2][i]
                             val rawH = outputArray[0][3][i]
 
-                            // 🌟 破案關鍵 2：無敵座標換算
-                            // 智慧判斷：如果數字大於 2，代表它是絕對像素(如 320)；如果是小數，代表它已經是比例(0.5)
-                            val cx = if (rawCx > 2f) rawCx / expectedWidth else rawCx
-                            val cy = if (rawCy > 2f) rawCy / expectedHeight else rawCy
-                            val w = if (rawW > 2f) rawW / expectedWidth else rawW
-                            val h = if (rawH > 2f) rawH / expectedHeight else rawH
+                            val cxInRoi = if (rawCx > 2f) rawCx / expectedWidth else rawCx
+                            val cyInRoi = if (rawCy > 2f) rawCy / expectedHeight else rawCy
+                            val wInRoi = if (rawW > 2f) rawW / expectedWidth else rawW
+                            val hInRoi = if (rawH > 2f) rawH / expectedHeight else rawH
 
-                            val left = cx - (w / 2)
-                            val top = cy - (h / 2)
+                            val cxInImg = roiX + (cxInRoi * roiSize)
+                            val cyInImg = roiY + (cyInRoi * roiSize)
+                            val wInImg = wInRoi * roiSize
+                            val hInImg = hInRoi * roiSize
 
-                            // 🌟 改這裡：把 outW, outH, * 1280f 全刪了，直接傳送原本的比例
+                            val finalCx = cxInImg / bitmap.width
+                            val finalCy = cyInImg / bitmap.height
+                            val finalW = wInImg / bitmap.width
+                            val finalH = hInImg / bitmap.height
+
+                            val left = finalCx - (finalW / 2)
+                            val top = finalCy - (finalH / 2)
                             val className = "專家${index + 1}-類別$classId"
-                            allResults.add(DetectionResult(left, top, w, h, className, maxScore))
+
+                            // ==========================================
+                            // 🌟 路線 B：攔截綠色人行道，啟動 OpenCV 方向計算
+                            // ==========================================
+                            // ⚠️ 假設模型 2 (index 1) 是路面模型，且 classId 0 是綠色人行道
+                            // 如果你們的設定不同，請在這裡修改 classId 的數字！
+                            if (index == 1 && classId == 0) {
+                                try {
+                                    // 1. 將比例還原成絕對像素，並加入安全邊界(coerceIn)防止裁切超出圖片範圍
+                                    val cropX = (left * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+                                    val cropY = (top * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+                                    val cropW = (finalW * bitmap.width).toInt().coerceAtMost(bitmap.width - cropX)
+                                    val cropH = (finalH * bitmap.height).toInt().coerceAtMost(bitmap.height - cropY)
+
+                                    if (cropW > 0 && cropH > 0) {
+                                        // 2. 從原始的高畫質照片中，剪下綠色人行道區塊
+                                        val pathCrop = Bitmap.createBitmap(bitmap, cropX, cropY, cropW, cropH)
+
+                                        // 3. 送交 OpenCV 分析偏移量
+                                        val directionWarning = analyzeGreenPathDeviation(pathCrop)
+                                        Log.d("AI_TEST", "📍 人行道導航: $directionWarning")
+
+                                        // ⚡ 用完立刻釋放，防止記憶體洩漏
+                                        pathCrop.recycle()
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("AI_TEST", "裁切綠色人行道失敗: ${e.message}")
+                                }
+                            }
+                            // ==========================================
+
+                            allResults.add(DetectionResult(left, top, finalW, finalH, className, maxScore))
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("AI_TEST", "第 ${index + 1} 個模型運算失敗: ${e.message}")
+                    Log.e("AI_TEST", "模型運算失敗: ${e.message}")
+                } finally {
+                    resizedBitmap?.recycle()
                 }
-            } // 結束專家的 for 迴圈
+            }
 
-            // ==========================================
-            // 🌟 核心過濾器：NMS (非極大值抑制)
-            // ==========================================
+            croppedBitmap.recycle()
+
+            // 🌟 完整還原 NMS (非極大值抑制) 過濾邏輯
             val nmsResults = mutableListOf<DetectionResult>()
             val sortedResults = allResults.sortedByDescending { it.confidence }
 
@@ -148,7 +195,6 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                     val union = area1 + area2 - intersection
                     val iou = if (union > 0) intersection / union else 0f
 
-                    // 只要重疊超過 40%，就刪除分數較低的那一個
                     if (iou > 0.4f) {
                         isDuplicate = true
                         break
@@ -159,11 +205,47 @@ class TFLiteHelper(private val context: Context, private val onResult: (List<Det
                 }
             }
 
-            // 將過濾後「最精華」的結果傳出去畫
             onResult(nmsResults)
 
         } catch (e: Exception) {
             Log.e("AI_TEST", "推論總崩潰: ${e.message}")
+        }
+    }
+
+    // 🌟 專屬 OpenCV 演算法：計算綠色人行道重心偏移
+    private fun analyzeGreenPathDeviation(cropBitmap: Bitmap): String {
+        val mat = Mat()
+        Utils.bitmapToMat(cropBitmap, mat)
+
+        val hsvMat = Mat()
+        Imgproc.cvtColor(mat, hsvMat, Imgproc.COLOR_RGBA2BGR)
+        Imgproc.cvtColor(hsvMat, hsvMat, Imgproc.COLOR_BGR2HSV)
+
+        // 💡 如果抓不到綠色，可以放寬這個區間 (例如 lower 變成 30)
+        // 把下限的 35 調低到 25 (容忍偏黃的綠色)，50 調低到 30 (容忍比較暗的綠色)
+        val lowerGreen = Scalar(25.0, 30.0, 30.0)
+        val upperGreen = Scalar(85.0, 255.0, 255.0)
+
+        val mask = Mat()
+        Core.inRange(hsvMat, lowerGreen, upperGreen, mask)
+
+        val moments = Imgproc.moments(mask)
+
+        if (moments.m00 < 1000.0) {
+            mat.release(); hsvMat.release(); mask.release()
+            return "⚠️ 找不到清晰的綠色人行道"
+        }
+
+        val cx = (moments.m10 / moments.m00).toInt()
+        val centerX = mask.cols() / 2
+        val offsetPercentage = (cx - centerX).toFloat() / mask.cols()
+
+        mat.release(); hsvMat.release(); mask.release()
+
+        return when {
+            offsetPercentage > 0.15f -> "⚠️ 偏右了！觸發左震動"
+            offsetPercentage < -0.15f -> "⚠️ 偏左了！觸發右震動"
+            else -> "✅ 走在正中間"
         }
     }
 
