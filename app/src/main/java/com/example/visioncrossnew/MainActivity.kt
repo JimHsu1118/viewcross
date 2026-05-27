@@ -3,10 +3,13 @@ package com.example.visioncrossnew
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -25,6 +28,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tfLiteHelper: TFLiteHelper
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
+    private lateinit var statusTextView: TextView // 🌟 新增：畫面的文字顯示狀態欄
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -36,43 +40,73 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ==========================================
-        // 🌟 破案關鍵：在這裡喚醒 OpenCV 引擎！
-        // ==========================================
         if (!org.opencv.android.OpenCVLoader.initDebug()) {
             Log.e("AI_TEST", "❌ OpenCV 引擎啟動失敗！")
         } else {
-            Log.d("AI_TEST", "✅ OpenCV 引擎啟動成功！準備接手人行道運算")
+            Log.d("AI_TEST", "✅ OpenCV 引擎啟動成功！")
         }
-        // ==========================================
 
-        // 1. 建立根佈局 (可以讓多層畫面疊在一起)
         val rootLayout = FrameLayout(this)
 
-        // 2. 底層：相機畫面
         previewView = PreviewView(this)
-
-        // 🌟 強制畫面不要放大裁切，保留相機的完整視野
         previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
-
         rootLayout.addView(previewView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        // 3. 上層：透明的畫圖玻璃
         overlayView = OverlayView(this)
         rootLayout.addView(overlayView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
+        // ==========================================
+        // 🌟 新增：建立最上層的智慧導航文字橫幅
+        // ==========================================
+        statusTextView = TextView(this).apply {
+            textSize = 26f // 大字體方便觀看
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#A0000000")) // 高級感半透明黑底
+            gravity = Gravity.CENTER
+            text = "正在初始化系統..."
+            setPadding(20, 30, 20, 30)
+        }
+        val textParams = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP // 釘在手機螢幕最上方
+            topMargin = 60 // 往下移一點點避開手機瀏海與狀態欄
+        }
+        rootLayout.addView(statusTextView, textParams)
+        // ==========================================
+
         setContentView(rootLayout)
 
-        // 4. 初始化 AI (當 AI 找到紅綠燈，就會呼叫 setResults 畫出來)
-        tfLiteHelper = TFLiteHelper(this) { results ->
-            // 🌟 修正：對應 OverlayView.kt 中的 setResults 函數
-            runOnUiThread { overlayView.setResults(results) }
-        }
+        // 🌟 修正：配合 TFLiteHelper 的雙回調架構
+        tfLiteHelper = TFLiteHelper(
+            this,
+            onResult = { results ->
+                // YOLO 框框畫在玻璃墊上
+                runOnUiThread { overlayView.setResults(results) }
+            },
+            onNavigationResult = { status ->
+                // OpenCV 顏色導航字串直接洗在畫面的 TextView 上！
+                runOnUiThread {
+                    statusTextView.text = status
+                    // 根據不同狀態動態變換顏色，測試時一目了然
+                    when {
+                        status.contains("NORMAL") -> statusTextView.setTextColor(Color.GREEN)
+                        status.contains("OUT") -> statusTextView.setTextColor(Color.RED)
+                        else -> statusTextView.setTextColor(Color.YELLOW) // SHIFT LEFT/RIGHT
+                    }
+                }
+            }
+        )
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        if (allPermissionsGranted()) startCamera()
-        else requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
     }
 
     private fun startCamera() {
@@ -89,14 +123,12 @@ class MainActivity : AppCompatActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
-            // 🌟 修正：正確呼叫 imageAnalyzer
             imageAnalyzer.setAnalyzer(cameraExecutor) { imageProxy ->
                 var bitmap: Bitmap? = null
                 var rotatedBitmap: Bitmap? = null
                 try {
-                    bitmap = imageProxy.toBitmap() // 取得相機原始畫面
+                    bitmap = imageProxy.toBitmap()
                     if (bitmap != null) {
-                        // 抓取物理旋轉角度，用 Matrix 把相機畫面轉正
                         val rotationDegrees = imageProxy.imageInfo.rotationDegrees.toFloat()
                         val matrix = android.graphics.Matrix()
                         matrix.postRotate(rotationDegrees)
@@ -105,20 +137,14 @@ class MainActivity : AppCompatActivity() {
                             bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
                         )
 
-                        // 傳遞「轉正後」的真實影像寬高給畫布，用來計算 FIT_CENTER 的黑邊
                         overlayView.setCameraFrameSize(rotatedBitmap.width, rotatedBitmap.height)
-
-                        // 執行 AI 偵測
                         tfLiteHelper.detect(rotatedBitmap)
                     }
                 } catch (e: Exception) {
                     Log.e("AI_TEST", "影像分析失敗: ${e.message}")
                 } finally {
-                    // ⚡ 終極記憶體釋放：手動回收 Bitmap
                     bitmap?.recycle()
                     rotatedBitmap?.recycle()
-
-                    // 必須確保關閉 imageProxy，下一個影格才能進來
                     imageProxy.close()
                 }
             }
