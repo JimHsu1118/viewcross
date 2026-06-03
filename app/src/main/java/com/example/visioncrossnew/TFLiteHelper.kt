@@ -22,6 +22,10 @@ class TFLiteHelper(
 ) {
 
     private val interpreters = mutableListOf<Interpreter>()
+
+    // 🌟 用來儲存平滑化後的 X 軸重心 (防手抖)
+    private var smoothedCx: Float = -1f
+
     private val modelFiles = listOf(
         "traffic_1280_dynamic_range_quant.tflite",
         "yolov8n_dynamic_range_quant.tflite"
@@ -51,22 +55,14 @@ class TFLiteHelper(
         )
     }
 
-    // ==========================================================
-    // 📖 🌟 新增：AI 代號翻譯字典
-    // ==========================================================
     private fun getReadableClassName(modelIndex: Int, classId: Int): String {
         return when (modelIndex) {
-            // 🚥 模型 1：traffic_1280 (交通號誌)
             0 -> {
                 when (classId) {
                     0 -> "🚦 紅綠燈"
-                    // 💡 如果你們的模型有細分紅綠燈顏色，可以在這裡擴充，例如：
-                    // 1 -> "🔴 紅燈"
-                    // 2 -> "🟢 綠燈"
                     else -> "🚦 號誌"
                 }
             }
-            // 🚶‍♂️ 模型 2：yolov8n (日常障礙物 - 擷取最常見的危險)
             1 -> {
                 when (classId) {
                     0 -> "🚶 行人"
@@ -75,16 +71,15 @@ class TFLiteHelper(
                     3 -> "🏍️ 機車"
                     5 -> "🚌 公車"
                     7 -> "🚚 卡車"
-                    9 -> "🚦 紅綠燈" // COCO 內建的紅綠燈
+                    9 -> "🚦 紅綠燈"
                     15 -> "🐈 貓咪"
                     16 -> "🐕 狗狗"
-                    else -> "⚠️ 障礙物" // 其餘不重要的物品統稱障礙物
+                    else -> "⚠️ 障礙物"
                 }
             }
             else -> "未知"
         }
     }
-    // ==========================================================
 
     fun detect(bitmap: Bitmap) {
         if (interpreters.isEmpty()) return
@@ -93,6 +88,9 @@ class TFLiteHelper(
             val allResults = mutableListOf<DetectionResult>()
             val threshold = 0.3f
 
+            // ==========================================
+            // 🟢 軌道一：OpenCV 專用 (維持只看中間 60% 路面)
+            // ==========================================
             val minSize = minOf(bitmap.width, bitmap.height)
             val roiScale = 0.6f
             val roiSize = (minSize * roiScale).toInt()
@@ -101,15 +99,18 @@ class TFLiteHelper(
 
             val croppedBitmap = Bitmap.createBitmap(bitmap, roiX, roiY, roiSize, roiSize)
 
-            // 🟢 軌道一：獨立的 OpenCV 綠色人行道辨識
             try {
                 val directionWarning = detectGreenPathByColor(croppedBitmap)
                 onNavigationResult(directionWarning)
             } catch (e: Exception) {
                 Log.e("AI_TEST", "OpenCV 辨識失敗: ${e.message}")
+            } finally {
+                croppedBitmap.recycle() // OpenCV 用完後，立刻把小圖丟掉回收
             }
 
-            // 🔴 軌道二：YOLO 尋找紅綠燈與障礙物
+            // ==========================================
+            // 🔴 軌道二：YOLO 大腦專用 (掃描完整全螢幕)
+            // ==========================================
             for ((index, interpreter) in interpreters.withIndex()) {
                 var resizedBitmap: Bitmap? = null
                 try {
@@ -117,7 +118,8 @@ class TFLiteHelper(
                     val expectedHeight = inputShape[1]
                     val expectedWidth = inputShape[2]
 
-                    resizedBitmap = Bitmap.createScaledBitmap(croppedBitmap, expectedWidth, expectedHeight, true)
+                    // 不再餵 croppedBitmap，直接把整張大圖餵給 AI
+                    resizedBitmap = Bitmap.createScaledBitmap(bitmap, expectedWidth, expectedHeight, true)
 
                     val byteBuffer = ByteBuffer.allocateDirect(1 * expectedWidth * expectedHeight * 3 * 4)
                     byteBuffer.order(ByteOrder.nativeOrder())
@@ -159,27 +161,15 @@ class TFLiteHelper(
                             val rawW = outputArray[0][2][i]
                             val rawH = outputArray[0][3][i]
 
-                            val cxInRoi = if (rawCx > 2f) rawCx / expectedWidth else rawCx
-                            val cyInRoi = if (rawCy > 2f) rawCy / expectedHeight else rawCy
-                            val wInRoi = if (rawW > 2f) rawW / expectedWidth else rawW
-                            val hInRoi = if (rawH > 2f) rawH / expectedHeight else rawH
-
-                            val cxInImg = roiX + (cxInRoi * roiSize)
-                            val cyInImg = roiY + (cyInRoi * roiSize)
-                            val wInImg = wInRoi * roiSize
-                            val hInImg = hInRoi * roiSize
-
-                            val finalCx = cxInImg / bitmap.width
-                            val finalCy = cyInImg / bitmap.height
-                            val finalW = wInImg / bitmap.width
-                            val finalH = hInImg / bitmap.height
+                            // 全螢幕座標還原 (直接轉成 0~1 的比例)
+                            val finalCx = if (rawCx > 2f) rawCx / expectedWidth else rawCx
+                            val finalCy = if (rawCy > 2f) rawCy / expectedHeight else rawCy
+                            val finalW = if (rawW > 2f) rawW / expectedWidth else rawW
+                            val finalH = if (rawH > 2f) rawH / expectedHeight else rawH
 
                             val left = finalCx - (finalW / 2)
                             val top = finalCy - (finalH / 2)
 
-                            // ==========================================
-                            // 🌟 核心修改：呼叫翻譯字典，取得真實名稱！
-                            // ==========================================
                             val className = getReadableClassName(index, classId)
 
                             allResults.add(DetectionResult(left, top, finalW, finalH, className, maxScore))
@@ -192,8 +182,7 @@ class TFLiteHelper(
                 }
             }
 
-            croppedBitmap.recycle()
-
+            // NMS 框框過濾邏輯
             val nmsResults = mutableListOf<DetectionResult>()
             val sortedResults = allResults.sortedByDescending { it.confidence }
 
@@ -226,6 +215,12 @@ class TFLiteHelper(
         }
     }
 
+    // ==========================================
+    // OpenCV 人行道演算法 (加入防手抖與高靈敏)
+    // ==========================================
+    // ==========================================
+    // OpenCV 人行道演算法 (加入記憶找回邏輯)
+    // ==========================================
     private fun detectGreenPathByColor(sourceBitmap: Bitmap): String {
         val mat = Mat()
         Utils.bitmapToMat(sourceBitmap, mat)
@@ -245,42 +240,61 @@ class TFLiteHelper(
         val hierarchy = Mat()
         Imgproc.findContours(mask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-        if (contours.isEmpty()) {
-            mat.release(); hsvMat.release(); mask.release(); hierarchy.release()
-            return "⚠️ 完全找不到綠色"
-        }
+        val w = mask.cols()
+        val h = mask.rows()
 
         var maxArea = 0.0
         var maxContour: org.opencv.core.MatOfPoint? = null
-        for (contour in contours) {
-            val area = Imgproc.contourArea(contour)
-            if (area > maxArea) {
-                maxArea = area
-                maxContour = contour
+
+        if (contours.isNotEmpty()) {
+            for (contour in contours) {
+                val area = Imgproc.contourArea(contour)
+                if (area > maxArea) {
+                    maxArea = area
+                    maxContour = contour
+                }
             }
         }
 
-        val w = mask.cols()
-        val h = mask.rows()
         val percentage = (maxArea / (w * h)) * 100
 
-        if (maxArea <= 3000 || percentage < 30.0) {
+        // ==========================================
+        // 🌟 核心進化：人行道消失時的「記憶找回」邏輯
+        // ==========================================
+        if (contours.isEmpty() || maxArea <= 3000 || percentage < 30.0) {
             contours.forEach { it.release() }
             mat.release(); hsvMat.release(); mask.release(); hierarchy.release()
-            return "⚠️ 偏離人行道"
+
+            // 判斷上一秒的重心位置 (smoothedCx) 來決定往哪裡找回
+            return when {
+                smoothedCx < 0f -> "⚠️ 請停下，尋找人行道" // 系統剛啟動，還沒看過人行道
+                smoothedCx < (w / 2) -> "⚠️ 偏離！請向左找回" // 消失前，人行道在偏左的位置
+                else -> "⚠️ 偏離！請向右找回"                 // 消失前，人行道在偏右的位置
+            }
         }
 
+        // ==========================================
+        // 正常導航時的重心計算與平滑化
+        // ==========================================
         val moments = Imgproc.moments(maxContour)
-        val cx = (moments.m10 / moments.m00).toInt()
+        val currentCx = (moments.m10 / moments.m00).toFloat()
 
         contours.forEach { it.release() }
         mat.release(); hsvMat.release(); mask.release(); hierarchy.release()
 
-        val centerThreshold = w * 0.1
+        // EMA 平滑濾波 (抗手抖)
+        if (smoothedCx < 0f) {
+            smoothedCx = currentCx
+        } else {
+            smoothedCx = (currentCx * 0.4f) + (smoothedCx * 0.6f)
+        }
+
+        val cx = smoothedCx.toInt()
+        val centerThreshold = w * 0.05
 
         return when {
-            cx < (w / 2) - centerThreshold -> "⚠️ 請向左回正"
-            cx > (w / 2) + centerThreshold -> "⚠️ 請向右回正"
+            cx < (w / 2) - centerThreshold -> "⚠️ 偏右了！請向左回正"
+            cx > (w / 2) + centerThreshold -> "⚠️ 偏左了！請向右回正"
             else -> "✅ 導航正常"
         }
     }

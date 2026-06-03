@@ -48,8 +48,12 @@ class MainActivity : AppCompatActivity() {
 
         val rootLayout = FrameLayout(this)
 
+        // 2. 底層：相機畫面
         previewView = PreviewView(this)
-        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+
+        // 🌟 核心修改：將 FIT_CENTER 改成 FILL_CENTER，強制畫面填滿整個手機螢幕！
+        previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+
         rootLayout.addView(previewView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         overlayView = OverlayView(this)
